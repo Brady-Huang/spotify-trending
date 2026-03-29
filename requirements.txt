@@ -1,0 +1,21 @@
+# Kafka
+kafka-python==2.0.2
+
+# Producer
+faker==20.1.0
+
+# Stream Processor
+pyspark==3.5.3
+pandas==2.1.0
+pyarrow==14.0.0
+
+# ClickHouse
+clickhouse-driver==0.2.6
+
+# API
+fastapi==0.104.1
+uvicorn==0.24.0
+redis==5.0.1
+
+# Utilities
+python-dotenv==1.0.0

@@ -33,6 +33,15 @@ services:
     ports:
       - "6379:6379"
 
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BROKER=kafka:29092
+
   spark:
     image: apache/spark:3.5.3
     environment:

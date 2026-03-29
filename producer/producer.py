@@ -4,11 +4,12 @@ import uuid
 import random
 from kafka import KafkaProducer
 from faker import Faker
+import os
 
 fake = Faker()
 
 KAFKA_TOPIC = "play-events"
-KAFKA_BROKER = "localhost:9092"
+KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "localhost:9092")
 
 TRACKS = [
     {
@@ -104,7 +105,6 @@ def simulate_user_session(producer, user_id, track, country):
 
         position_ms += 5000
         time.sleep(0.1)
-    
 
 def main():
     producer = create_producer()
