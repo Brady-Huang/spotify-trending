@@ -1,5 +1,7 @@
 import os
 import pandas as pd
+import numpy as np
+import logging
 from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json
@@ -10,11 +12,19 @@ from pyspark.sql.streaming.state import GroupState, GroupStateTimeout
 import clickhouse_driver
 
 # --- 配置區 ---
-KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "localhost:9092")
+KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:29092")
 KAFKA_TOPIC = "play-events"
-CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "localhost")
+CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "clickhouse")
+CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "/tmp/spark-checkpoint")
 PLAY_THRESHOLD_MS = 30000
-CHECKPOINT_DIR = "/tmp/spark-checkpoint-v2"
+
+# 設定日誌格式：時間 - 層級 - 訊息
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("SpotifyProcessor")
 
 # 1. 定義 Kafka 輸入 Schema
 EVENT_SCHEMA = StructType([
@@ -49,17 +59,13 @@ def create_spark_session():
         .master(spark_master) \
         .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3") \
         .config("spark.sql.shuffle.partitions", "4") \
+        .config("spark.streaming.backpressure.enabled", "true") \
+        .config("spark.streaming.backpressure.initialRate", "1000") \
         .getOrCreate()
 
 def update_session_state(session_id, pdf_iterator, state: GroupState):
-    """
-    1. 解決 PySparkTypeError (使用 yield)
-    2. 解決 Missing columns: event_timestamp (從原始數據提取)
-    3. 解決 is_valid 欄位對齊 (使用 UInt8 數值)
-    """
     s_id = str(session_id[0]) if isinstance(session_id, tuple) else str(session_id)
 
-    # 讀取狀態
     if state.exists:
         accumulated_ms, play_fact_emitted = state.get
     else:
@@ -67,22 +73,23 @@ def update_session_state(session_id, pdf_iterator, state: GroupState):
         play_fact_emitted = False
 
     results = []
-
+    cols = PLAY_FACT_SCHEMA.names
     for df in pdf_iterator:
         for row in df.itertuples():
-            # --- 時間戳記處理 ---
-            # 優先從原始 row 抓取 'timestamp' 欄位
             raw_ts = getattr(row, 'timestamp', None)
-            # 如果原始資料有時間就用原始的，沒有才用處理當下的時間 (Fallback)
-            event_ts = pd.to_datetime(raw_ts, unit='s') if raw_ts else datetime.now()
+            if raw_ts:
+                # 先轉為 UTC，再轉為台北時區，最後移除時區標籤以符合 Spark TimestampType
+                event_ts = pd.to_datetime(float(raw_ts), unit='s', utc=True) \
+                            .tz_convert('Asia/Taipei') \
+                            .tz_localize(None)
+            else:
+                event_ts = pd.Timestamp.now()
 
-            # --- 播放狀態邏輯 ---
             current_state = getattr(row, 'state', None)
             if current_state == "play":
-                accumulated_ms += 5000 # 假設每 5 秒一筆
+                accumulated_ms += 5000
 
-            # --- 達標判定 (30秒) ---
-            if accumulated_ms >= 30000 and not play_fact_emitted:
+            if accumulated_ms >= PLAY_THRESHOLD_MS and not play_fact_emitted:
                 results.append({
                     "session_id": s_id,
                     "user_id": str(getattr(row, 'user_id', '')),
@@ -90,42 +97,35 @@ def update_session_state(session_id, pdf_iterator, state: GroupState):
                     "title": str(getattr(row, 'title', '')),
                     "genre": str(getattr(row, 'genre', '')),
                     "country": str(getattr(row, 'country', '')),
-                    "is_valid": 1,  # ClickHouse 用 1 代表 True
+                    "is_valid": 1,
                     "event_timestamp": event_ts
                 })
                 play_fact_emitted = True
+                logger.info(f"PlayFact Emitted: {getattr(row, 'title', '')} ({getattr(row, 'country', '')})")
 
-            # --- Stop 訊號處理 ---
             if current_state == "stop":
                 if not play_fact_emitted:
                     results.append({
-                        "session_id": s_id, 
-                        "user_id": str(getattr(row, 'user_id', '')), 
+                        "session_id": s_id,
+                        "user_id": str(getattr(row, 'user_id', '')),
                         "track_id": str(getattr(row, 'track_id', '')),
-                        "title": str(getattr(row, 'title', '')), 
-                        "genre": str(getattr(row, 'genre', '')), 
-                        "country": str(getattr(row, 'country', '')), 
+                        "title": str(getattr(row, 'title', '')),
+                        "genre": str(getattr(row, 'genre', '')),
+                        "country": str(getattr(row, 'country', '')),
                         "is_valid": 0,
                         "event_timestamp": event_ts
                     })
                 state.remove()
-                yield pd.DataFrame(results) if results else pd.DataFrame(columns=PLAY_FACT_SCHEMA.names)
+                if results:
+                    yield pd.DataFrame(results)[cols]
                 return
 
-    # 保存狀態並回傳
-    state.update((accumulated_ms, play_fact_emitted))
-    
-    if not results:
-        yield pd.DataFrame(columns=PLAY_FACT_SCHEMA.names)
-    else:
-        yield pd.DataFrame(results)
+        state.update((accumulated_ms, play_fact_emitted))
+        if results:
+            yield pd.DataFrame(results)[cols]
 
 def init_clickhouse():
-    """在啟動前執行一次，確保 Table 與 Materialized View 結構對齊最新邏輯"""
     client = clickhouse_driver.Client(host=CLICKHOUSE_HOST)
-    
-    # 1. 建立原始事實表 (Raw Facts)
-    # 我們將 played_at 改為 event_timestamp，並增加 is_valid
     client.execute("""
         CREATE TABLE IF NOT EXISTS play_facts (
             session_id      String,
@@ -139,71 +139,72 @@ def init_clickhouse():
         ) ENGINE = MergeTree()
         ORDER BY (event_timestamp, country, genre)
     """)
-
-    # 2. 建立每分鐘統計視圖 (Materialized View)
-    # 注意：我們只統計 is_valid = 1 (聽滿 30 秒) 的數據
     client.execute("""
         CREATE MATERIALIZED VIEW IF NOT EXISTS play_counts_1m
         ENGINE = SummingMergeTree()
         ORDER BY (window_start, track_id, country, genre)
         AS SELECT
             toStartOfMinute(event_timestamp) AS window_start,
-            track_id, 
-            title, 
-            genre, 
+            track_id,
+            title,
+            genre,
             country,
             count() AS play_count
         FROM play_facts
         WHERE is_valid = 1
         GROUP BY window_start, track_id, title, genre, country
     """)
-    print("[ClickHouse] DDL initialized with Event-Time and Validation logic.")
-
+    logger.info("[ClickHouse] Tables ready ✅")
 
 def write_to_clickhouse(batch_df, batch_id):
-    # 只過濾出有效播放且轉換為 row list
-    rows = batch_df.collect()
-    if not rows:
-        return
+    row_count = batch_df.count()
 
-    client = clickhouse_driver.Client(host=CLICKHOUSE_HOST)
-    data = [{
-        "session_id": r.session_id,
-        "user_id": r.user_id,
-        "track_id": r.track_id,
-        "title": r.title,
-        "genre": r.genre,
-        "country": r.country,
-        "is_valid": r.is_valid,
-        "event_timestamp": r.event_timestamp
-    } for r in rows]
-    client.execute(
-        "INSERT INTO play_facts (session_id, user_id, track_id, title, genre, country, is_valid, event_timestamp) VALUES",
-        data
-    )
-    print(f"🚀 [ClickHouse] Batch {batch_id}: Inserted {len(data)} records.")
+    def send_to_clickhouse(partition_iterator):
+        client = clickhouse_driver.Client(host=CLICKHOUSE_HOST)
+        data = []
+        for r in partition_iterator:
+            data.append({
+                "session_id": r.session_id,
+                "user_id": r.user_id,
+                "track_id": r.track_id,
+                "title": r.title,
+                "genre": r.genre,
+                "country": r.country,
+                "is_valid": r.is_valid,
+                "event_timestamp": r.event_timestamp
+            })
+        if data:
+            client.execute(
+                "INSERT INTO play_facts (session_id, user_id, track_id, title, genre, country, is_valid, event_timestamp) VALUES",
+                data
+            )
     
+    # 使用 foreachPartition 防止 Driver 記憶體爆炸
+    batch_df.foreachPartition(send_to_clickhouse)
+    if row_count > 0:
+        logger.info(f"🚀 [Batch {batch_id}] Successfully wrote {row_count} rows to ClickHouse.")
+    else:
+        logger.info(f"💤 [Batch {batch_id}] No data to process.")
+
 def main():
-    # 初始化 ClickHouse Table
     init_clickhouse()
-    
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
-
-    print(f"[Processor] Connecting to Kafka: {KAFKA_BROKER}")
 
     raw_df = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", KAFKA_BROKER) \
         .option("subscribe", KAFKA_TOPIC) \
-        .option("startingOffsets", "latest") \
+        .option("startingOffsets", "earliest") \
+        .option("maxOffsetsPerTrigger", "2000")\
+        .option("failOnDataLoss", "false") \
         .load()
 
     events_df = raw_df.select(
         from_json(col("value").cast("string"), EVENT_SCHEMA).alias("data")
     ).select("data.*")
 
-    # 狀態處理
+    # 狀態處理：確保 groupBy 後進行狀態運算
     play_facts_df = events_df \
         .groupBy("session_id") \
         .applyInPandasWithState(

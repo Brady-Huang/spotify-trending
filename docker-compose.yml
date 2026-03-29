@@ -76,6 +76,10 @@ services:
       - KAFKA_BROKER=kafka:29092
       - CLICKHOUSE_HOST=clickhouse
       - SPARK_MASTER=spark://spark:7077
+      - CHECKPOINT_DIR=/tmp/spark-checkpoint-v6
+      
+    volumes:
+      - spark_checkpoint_v6:/tmp/spark-checkpoint-v6
 
   api:
     build:
@@ -92,3 +96,4 @@ services:
 
 volumes:
   clickhouse_data:
+  spark_checkpoint_v6:
