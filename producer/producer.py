@@ -8,17 +8,13 @@ import os
 
 fake = Faker()
 
+random.seed(42)     
+Faker.seed(42)
+
 KAFKA_TOPIC = "play-events"
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "localhost:9092")
 
-TRACKS = [
-    {
-        "track_id": f"track_{i}",
-        "title": fake.catch_phrase(),
-        "genre": random.choice(["pop", "rock", "hip-hop", "jazz", "classical"])
-    }
-    for i in range(50)
-]
+
 
 # 按真實用戶比例加權，模擬 hot shard 問題
 # Spotify 2023 用戶分佈參考
@@ -62,6 +58,8 @@ TRACKS = [
     }
     for i in range(50)
 ]
+
+random.seed()
 
 def create_producer():
     return KafkaProducer(
