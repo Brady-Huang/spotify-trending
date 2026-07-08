@@ -1,25 +1,16 @@
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/.terraform.lock.hcl
+
+# GCP credentials - NEVER commit this
+terraform-key.json
+*.json.key
+
 # Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-.env
-venv/
-.venv/
+*.pyc
 
-# Spark
-derby.log
-metastore_db/
-spark-warehouse/
-
-# Docker
-*.log
-
-# OS
+# Mac
 .DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
