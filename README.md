@@ -2,12 +2,14 @@
 
 A production-grade real-time data pipeline simulating Spotify's trending songs system, based on the system design from [Build Moat](https://buildmoat.org).
 
-## System Architecture (Version A — Streaming)
+## System Architecture
+
 ```
-Producer → Kafka → Spark Structured Streaming → ClickHouse → Redis Cache → FastAPI → Superset
+Producer → Kafka → Spark Structured Streaming → ClickHouse → Redis Cache → FastAPI
 ```
 
 ### Architecture Diagram
+
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────────────────┐
 │   Producer  │────▶│    Kafka    │────▶│  Spark Structured       │
@@ -18,12 +20,12 @@ Producer → Kafka → Spark Structured Streaming → ClickHouse → Redis Cache
                                         └────────────┬────────────┘
                                                      │
                                                      ▼
-┌─────────────┐     ┌─────────────┐     ┌─────────────────────────┐
-│  Superset   │◀────│    Redis    │◀────│      ClickHouse         │
-│ (Dashboard) │     │   (Cache)   │     │  - play_facts           │
-└─────────────┘     └─────────────┘     │  - play_counts_1m (MV)  │
-                          │             └─────────────────────────┘
-                          ▼
+                    ┌─────────────┐     ┌─────────────────────────┐
+                    │    Redis    │◀────│      ClickHouse         │
+                    │   (Cache)   │     │  - play_facts           │
+                    └──────┬──────┘     │  - play_counts_1m (MV)  │
+                           │            └─────────────────────────┘
+                           ▼
                     ┌─────────────┐
                     │   FastAPI   │
                     │  (Top K API)│
@@ -44,26 +46,37 @@ Producer → Kafka → Spark Structured Streaming → ClickHouse → Redis Cache
 ### Key Design Decisions
 
 #### Effective Play Count
-Following Spotify's official definition:
-> A stream is counted when a listener plays a song for **at least 30 seconds**
+Following Spotify's official definition, a stream is counted when a listener plays a song for at least 30 seconds.
 
 Implemented via Spark `applyInPandasWithState`:
 - Per-session state tracks `accumulated_ms`
-- PlayFact emitted when `accumulated_ms >= 30,000ms`
-- Deduplication via `event_id`
+- PlayFact emitted once when `accumulated_ms >= 30,000ms`
+- `play_fact_emitted` flag prevents duplicate counting within the same session
+
+`applyInPandasWithState` was chosen over `mapGroupsWithState` because it allows yielding multiple rows per group update and integrates naturally with pandas, making the session logic easier to reason about.
+
+#### Writing to ClickHouse via `foreachPartition`
+Rather than using `foreach` (which creates one connection per row), the processor uses `foreachPartition` to batch all rows in a partition into a single INSERT. This avoids driver OOM issues and reduces connection overhead significantly.
 
 #### OLAP Storage
 ClickHouse with column-oriented storage for efficient analytical queries:
 - `play_facts` — raw PlayFact events
-- `play_counts_1m` — Materialized View aggregated by minute
+- `play_counts_1m` — Materialized View aggregated by minute using `SummingMergeTree`
+
+ClickHouse was chosen over cloud-native OLAP (e.g. BigQuery) because this project is designed to be fully self-hosted and runnable with a single `docker-compose up`. In a production cloud environment, BigQuery or Redshift would be natural alternatives.
+
+#### Redis Cache (Cache-Aside Pattern)
+FastAPI uses a cache-aside pattern with 60s TTL:
+1. Check Redis for cached result
+2. On cache miss, query ClickHouse and write result to Redis
+3. Subsequent requests within TTL are served from Redis
+
+This avoids repeated ClickHouse aggregation queries for the same Top K parameters.
 
 #### Hot Shard Simulation
 Producer simulates real-world traffic distribution:
 - US: 28%, BR: 10%, UK: 8%, TW: 2%, etc.
-- Demonstrates the hot shard problem described in the PDF
-
-#### Caching
-Redis cache with 60s TTL for Top K query results, reducing ClickHouse load.
+- Demonstrates the hot shard problem where high-volume partitions cause uneven Kafka consumer load
 
 ## Components
 
@@ -73,9 +86,8 @@ Redis cache with 60s TTL for Top K query results, reducing ClickHouse load.
 | Message Queue | Kafka + Zookeeper | Event buffer and delivery |
 | Stream Processor | PySpark Structured Streaming | Dedup + session tracking + PlayFact |
 | OLAP | ClickHouse | Aggregated Top K storage |
-| Cache | Redis | Query result caching |
+| Cache | Redis | Query result caching (cache-aside) |
 | API | FastAPI | Top K query endpoint |
-| Dashboard | Apache Superset | Visualization |
 
 ## API Endpoints
 
@@ -100,7 +112,7 @@ curl "http://localhost:8000/top_tracks?dim=country&num_tracks=10&window=1h"
 **Response:**
 ```json
 {
-  "source": "clickhouse",
+  "source": "cache",
   "data": [
     {
       "rank": 1,
@@ -112,6 +124,8 @@ curl "http://localhost:8000/top_tracks?dim=country&num_tracks=10&window=1h"
   ]
 }
 ```
+
+`source` indicates whether the result was served from `cache` (Redis) or `clickhouse` (cache miss).
 
 ### GET /health
 ```bash
@@ -126,14 +140,11 @@ curl "http://localhost:8000/health"
 
 ### Run
 ```bash
-# Clone the repo
-git clone https://github.com/your-username/spotify-trending.git
+git clone https://github.com/Brady-Huang/spotify-trending.git
 cd spotify-trending
 
-# Start all services
 docker-compose up -d
 
-# Check all services are healthy
 docker-compose ps
 ```
 
@@ -144,27 +155,7 @@ docker-compose ps
 | FastAPI | http://localhost:8000 |
 | API Docs | http://localhost:8000/docs |
 | Spark UI | http://localhost:8080 |
-| Superset | http://localhost:8088 |
 | ClickHouse | http://localhost:8123 |
-
-### Superset Setup (First Time)
-```bash
-# Initialize database
-docker-compose exec superset superset db upgrade
-
-# Create admin account
-docker-compose exec superset superset fab create-admin \
-  --username admin \
-  --firstname Admin \
-  --lastname Admin \
-  --email admin@example.com \
-  --password admin
-
-# Initialize
-docker-compose exec superset superset init
-```
-
-Login at http://localhost:8088 with `admin / admin`
 
 ### Stop
 ```bash
@@ -176,7 +167,7 @@ docker-compose down
 docker-compose up -d
 ```
 
-> **Note:** Checkpoint data is persisted in Docker volumes. On restart, the stream processor will resume from Kafka's latest offset.
+> **Note:** Checkpoint data is persisted in Docker volumes. On restart, the stream processor will resume from the last committed Kafka offset.
 
 ## Project Structure
 ```
@@ -185,10 +176,10 @@ spotify-trending/
 │   ├── producer.py          # Simulates play events with weighted country distribution
 │   └── Dockerfile
 ├── processor/
-│   ├── stream_processor.py  # PySpark Structured Streaming processor
+│   ├── stream_processor.py  # PySpark Structured Streaming with stateful session tracking
 │   └── Dockerfile
 ├── api/
-│   ├── main.py              # FastAPI Top K endpoint
+│   ├── main.py              # FastAPI Top K endpoint with Redis cache-aside
 │   └── Dockerfile
 ├── spark/
 │   └── Dockerfile           # Custom Spark image with Python dependencies
@@ -236,13 +227,3 @@ Based on 700M MAUs with 20% daily active users:
 = ~4.2 Billion events/hour
 = ~1.2 Million events/second
 ```
-
-## Roadmap
-
-- [x] Version A: Streaming pipeline
-- [ ] Version B: Lambda Architecture
-  - [ ] PostgreSQL (Event DB)
-  - [ ] Debezium (CDC)
-  - [ ] MinIO (S3-compatible storage)
-  - [ ] Apache Iceberg (Table format)
-  - [ ] Spark Batch Jobs
