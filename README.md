@@ -4,8 +4,14 @@ A production-grade real-time data pipeline simulating Spotify's trending songs s
 
 ## System Architecture
 
+**Streaming (Real-time):**
 ```
 Producer → Kafka → Spark Structured Streaming → ClickHouse → Redis Cache → FastAPI
+```
+
+**Batch (Daily):**
+```
+Airflow DAG (daily @ 1AM) → ClickHouse (play_facts) → daily_trending
 ```
 
 ### Architecture Diagram
@@ -24,12 +30,13 @@ Producer → Kafka → Spark Structured Streaming → ClickHouse → Redis Cache
                     │    Redis    │◀────│      ClickHouse         │
                     │   (Cache)   │     │  - play_facts           │
                     └──────┬──────┘     │  - play_counts_1m (MV)  │
-                           │            └─────────────────────────┘
-                           ▼
-                    ┌─────────────┐
-                    │   FastAPI   │
-                    │  (Top K API)│
-                    └─────────────┘
+                           │            │  - daily_trending        │
+                           ▼            └────────────▲────────────┘
+                    ┌─────────────┐                  │
+                    │   FastAPI   │     ┌─────────────────────────┐
+                    │  (Top K API)│     │  Airflow DAG            │
+                    └─────────────┘     │  (daily @ 1AM)          │
+                                        └─────────────────────────┘
 ```
 
 ## System Design
@@ -37,6 +44,7 @@ Producer → Kafka → Spark Structured Streaming → ClickHouse → Redis Cache
 ### Functional Requirements
 1. Collect listening metrics from clients
 2. Provide Top K songs by different dimensions (country, genre)
+3. Generate daily trending report
 
 ### Non-Functional Requirements
 1. Generate Top K results ASAP after each hour/day ends
@@ -62,6 +70,7 @@ Rather than using `foreach` (which creates one connection per row), the processo
 ClickHouse with column-oriented storage for efficient analytical queries:
 - `play_facts` — raw PlayFact events
 - `play_counts_1m` — Materialized View aggregated by minute using `SummingMergeTree`
+- `daily_trending` — pre-aggregated daily Top 10 by country and genre, populated by Airflow
 
 ClickHouse was chosen over cloud-native OLAP (e.g. BigQuery) because this project is designed to be fully self-hosted and runnable with a single `docker-compose up`. In a production cloud environment, BigQuery or Redshift would be natural alternatives.
 
@@ -72,6 +81,14 @@ FastAPI uses a cache-aside pattern with 60s TTL:
 3. Subsequent requests within TTL are served from Redis
 
 This avoids repeated ClickHouse aggregation queries for the same Top K parameters.
+
+#### Airflow Batch Pipeline
+A daily Airflow DAG runs at 1AM to compute the previous day's Top 10 trending songs:
+- `check_clickhouse_connection` — verifies ClickHouse is reachable before proceeding
+- `create_daily_trending_table` — idempotent table creation
+- `compute_daily_trending` — aggregates `play_facts` by country and genre, writes to `daily_trending`
+
+Separating batch from streaming allows historical analysis without impacting the real-time query path.
 
 #### Hot Shard Simulation
 Producer simulates real-world traffic distribution:
@@ -88,6 +105,7 @@ Producer simulates real-world traffic distribution:
 | OLAP | ClickHouse | Aggregated Top K storage |
 | Cache | Redis | Query result caching (cache-aside) |
 | API | FastAPI | Top K query endpoint |
+| Batch Scheduler | Airflow | Daily trending report pipeline |
 
 ## API Endpoints
 
@@ -148,6 +166,19 @@ docker-compose up -d
 docker-compose ps
 ```
 
+### Airflow Setup (First Time)
+```bash
+docker-compose exec airflow airflow users create \
+  --username admin \
+  --password admin \
+  --firstname Admin \
+  --lastname User \
+  --role Admin \
+  --email admin@example.com
+```
+
+Login at http://localhost:8090 with `admin / admin`
+
 ### Service URLs
 
 | Service | URL |
@@ -155,6 +186,7 @@ docker-compose ps
 | FastAPI | http://localhost:8000 |
 | API Docs | http://localhost:8000/docs |
 | Spark UI | http://localhost:8080 |
+| Airflow UI | http://localhost:8090 |
 | ClickHouse | http://localhost:8123 |
 
 ### Stop
@@ -181,8 +213,17 @@ spotify-trending/
 ├── api/
 │   ├── main.py              # FastAPI Top K endpoint with Redis cache-aside
 │   └── Dockerfile
+├── airflow/
+│   ├── Dockerfile           # Airflow image with clickhouse-driver
+│   └── dags/
+│       └── daily_trending.py  # Daily batch DAG for trending report
 ├── spark/
 │   └── Dockerfile           # Custom Spark image with Python dependencies
+├── terraform/
+│   ├── main.tf              # GCP resources (VPC, VM, GCS, firewall)
+│   ├── variables.tf
+│   ├── outputs.tf
+│   └── startup.sh           # VM startup script
 ├── docker-compose.yml
 ├── requirements.txt
 └── README.md
@@ -218,6 +259,31 @@ FROM play_facts
 WHERE is_valid = 1
 GROUP BY window_start, track_id, title, genre, country
 ```
+
+### daily_trending (Batch Output)
+```sql
+CREATE TABLE daily_trending (
+    report_date     Date,
+    dimension_type  String,
+    dimension_value String,
+    track_id        String,
+    title           String,
+    total_plays     UInt64,
+    rank            UInt32
+) ENGINE = MergeTree()
+ORDER BY (report_date, dimension_type, rank)
+```
+
+## Deploy to GCP
+
+```bash
+cd terraform
+terraform init
+terraform apply
+```
+
+Resources created: VPC, subnet, firewall, static IP, GCS bucket, GCE VM (e2-standard-4).
+The VM automatically clones this repo and runs `docker-compose up` on startup.
 
 ## Capacity Estimation
 
