@@ -84,7 +84,7 @@ services:
     depends_on:
       spark:
         condition: service_healthy
-  
+
   producer:
     build:
       context: .
@@ -111,7 +111,6 @@ services:
       - CLICKHOUSE_HOST=clickhouse
       - SPARK_MASTER=spark://spark:7077
       - CHECKPOINT_DIR=/tmp/spark-checkpoint-v7
-      
     volumes:
       - spark_checkpoint_v7:/tmp/spark-checkpoint-v7
     user: "root"
@@ -130,6 +129,7 @@ services:
     environment:
       - CLICKHOUSE_HOST=clickhouse
       - REDIS_HOST=redis
+
   airflow-db:
     image: postgres:15
     environment:
@@ -140,24 +140,67 @@ services:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 5s
       retries: 5
-  airflow:
+
+  # 一次性初始化：跑 db migrate + 建立固定帳密的 admin 帳號，跑完即結束
+  airflow-init:
     build:
       context: ./airflow
       dockerfile: Dockerfile
     depends_on:
       airflow-db:
         condition: service_healthy
+    environment: &airflow-common-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # 固定值，避免每次重啟隨機產生 → 之前加密的資料讀不出來 / session 全部失效
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A=}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY:-please-change-me-too}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+
+  airflow-webserver:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
-    environment:
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-db/airflow
-      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+    environment: *airflow-common-env
     volumes:
       - ./airflow/dags:/opt/airflow/dags
     ports:
       - "8090:8080"
-    command: standalone
+    command: webserver
+
+  airflow-scheduler:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    environment: *airflow-common-env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    command: scheduler
+
 volumes:
   clickhouse_data:
   spark_checkpoint_v7:
