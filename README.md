@@ -1,3 +1,4 @@
+
 # Spotify Trending Songs — Real-Time Data Pipeline
 
 A production-grade real-time data pipeline simulating Spotify's trending songs system, based on the system design from [Build Moat](https://buildmoat.org).
@@ -47,9 +48,12 @@ Airflow DAG (daily @ 1AM) → ClickHouse (play_facts) → daily_trending
 3. Generate daily trending report
 
 ### Non-Functional Requirements
-1. Generate Top K results ASAP after each hour/day ends
-2. Scale to 700M MAUs, 100M tracks
-3. High accuracy — avoid over/under-counting
+1. High accuracy — count a play only after 30 seconds of listening
+2. Low latency — Top K results updated every minute via Materialized View
+
+### Production Considerations
+1. Scale to 700M MAUs (~1.2M events/sec) — requires horizontal scaling of Kafka partitions, Spark executors, and ClickHouse shards
+2. Generate Top K results ASAP after each hour/day ends — would require windowed aggregation triggers rather than fixed 1AM batch
 
 ### Key Design Decisions
 
@@ -145,8 +149,15 @@ curl "http://localhost:8000/top_tracks?dim=country&num_tracks=10&window=1h"
 
 `source` indicates whether the result was served from `cache` (Redis) or `clickhouse` (cache miss).
 
-
 ## Quick Start
+
+Once all services are up, the pipeline runs automatically:
+
+1. **Producer** continuously sends simulated play events to Kafka
+2. **Spark** consumes from Kafka, tracks each session's listening time, and emits a PlayFact once a user has listened for 30 seconds
+3. **ClickHouse** stores the PlayFacts and aggregates them by minute via a Materialized View
+4. **FastAPI** serves real-time Top K queries, backed by Redis cache
+5. **Airflow** runs a daily batch job at 1AM to compute the previous day's Top 10 — you can also trigger it manually to see results immediately
 
 ### Prerequisites
 - Docker + Docker Compose
@@ -189,9 +200,39 @@ Open http://localhost:4040 → Structured Streaming tab. You should see input/pr
 curl "http://localhost:8000/top_tracks?dim=country&num_tracks=5&window=1h"
 ```
 
-**5. Trigger the daily batch DAG manually**
+**5. Explore ClickHouse directly**
 
-Open http://localhost:8090, find `daily_trending`, and trigger it manually — no need to wait until 1AM to see the batch results.
+Open http://localhost:8123/play to run queries in the browser:
+
+```sql
+-- Confirm data is flowing in
+SELECT count() FROM play_facts
+
+-- View raw events
+SELECT * FROM play_facts LIMIT 10
+
+-- Country distribution (validates hot shard simulation)
+SELECT country, count() AS plays
+FROM play_facts
+GROUP BY country
+ORDER BY plays DESC
+
+-- Real-time play counts per minute (Materialized View)
+SELECT window_start, sum(play_count) AS plays
+FROM play_counts_1m
+GROUP BY window_start
+ORDER BY window_start DESC
+LIMIT 10
+
+-- Daily trending results (after triggering Airflow DAG)
+SELECT * FROM daily_trending
+WHERE report_date = today()
+ORDER BY rank ASC
+```
+
+**6. Trigger the daily batch DAG manually**
+
+Open http://localhost:8090, find `daily_trending`, and trigger it manually — no need to wait until 1AM to see batch results. Once complete, run the `daily_trending` query above in ClickHouse Play to verify the output.
 
 ### Service URLs
 
