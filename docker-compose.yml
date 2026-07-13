@@ -84,7 +84,7 @@ services:
     depends_on:
       spark:
         condition: service_healthy
-
+    
   producer:
     build:
       context: .
@@ -114,7 +114,9 @@ services:
     volumes:
       - spark_checkpoint_v7:/tmp/spark-checkpoint-v7
     user: "root"
-
+    ports:
+      - "4040:4040"
+  
   api:
     build:
       context: .

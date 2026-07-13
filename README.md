@@ -145,10 +145,6 @@ curl "http://localhost:8000/top_tracks?dim=country&num_tracks=10&window=1h"
 
 `source` indicates whether the result was served from `cache` (Redis) or `clickhouse` (cache miss).
 
-### GET /health
-```bash
-curl "http://localhost:8000/health"
-```
 
 ## Quick Start
 
@@ -161,23 +157,41 @@ curl "http://localhost:8000/health"
 git clone https://github.com/Brady-Huang/spotify-trending.git
 cd spotify-trending
 
-docker-compose up -d
-
-docker-compose ps
+docker compose up -d
 ```
 
-### Airflow Setup (First Time)
+> Services may take 1-2 minutes to fully start. Use `docker compose ps` to check status.
+
+Airflow is automatically initialized on first run. Login at http://localhost:8090 with `admin / admin`.
+
+### Verify It's Working
+
+Follow the data flow step by step:
+
+**1. Check producer is sending events**
 ```bash
-docker-compose exec airflow airflow users create \
-  --username admin \
-  --password admin \
-  --firstname Admin \
-  --lastname User \
-  --role Admin \
-  --email admin@example.com
+docker compose logs -f producer
+```
+You should see play events being emitted every few seconds.
+
+**2. Check processor is consuming from Kafka**
+```bash
+docker compose logs -f processor
+```
+You should see Spark batch processing logs.
+
+**3. Check Spark Structured Streaming**
+
+Open http://localhost:4040 → Structured Streaming tab. You should see input/processing rate and batch progress.
+
+**4. Query the Top K API**
+```bash
+curl "http://localhost:8000/top_tracks?dim=country&num_tracks=5&window=1h"
 ```
 
-Login at http://localhost:8090 with `admin / admin`
+**5. Trigger the daily batch DAG manually**
+
+Open http://localhost:8090, find `daily_trending`, and trigger it manually — no need to wait until 1AM to see the batch results.
 
 ### Service URLs
 
@@ -185,18 +199,19 @@ Login at http://localhost:8090 with `admin / admin`
 |---|---|
 | FastAPI | http://localhost:8000 |
 | API Docs | http://localhost:8000/docs |
-| Spark UI | http://localhost:8080 |
+| Spark Master UI | http://localhost:8080 |
+| Spark Application UI | http://localhost:4040 |
 | Airflow UI | http://localhost:8090 |
 | ClickHouse | http://localhost:8123 |
 
 ### Stop
 ```bash
-docker-compose down
+docker compose down
 ```
 
 ### Restart
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 > **Note:** Checkpoint data is persisted in Docker volumes. On restart, the stream processor will resume from the last committed Kafka offset.
@@ -283,13 +298,21 @@ terraform apply
 ```
 
 Resources created: VPC, subnet, firewall, static IP, GCS bucket, GCE VM (e2-standard-4).
-The VM automatically clones this repo and runs `docker-compose up` on startup.
+The VM automatically clones this repo and runs `docker compose up` on startup.
 
 ## Capacity Estimation
 
 Based on 700M MAUs with 20% daily active users:
+
+Assumptions:
+- 20% DAU rate → 140M daily active users
+- DAU distributed evenly across 24 hours → at any given hour, 1/24 of DAU are active
+- Each active user generates 1 event every 5 seconds
+
 ```
-700M × 20% × 3600s/hr ÷ 5s/event ÷ 24hr
+700M × 20% ÷ 24hr × 3600s/hr ÷ 5s/event
 = ~4.2 Billion events/hour
 = ~1.2 Million events/second
 ```
+
+This project simulates the architecture at this scale. The local Docker Compose setup is for development and demonstration purposes. In a real deployment, Kafka partitions, Spark workers, and ClickHouse shards would scale horizontally to handle ~1.2M events/sec.
