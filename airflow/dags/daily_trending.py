@@ -46,8 +46,7 @@ def create_daily_trending_table():
     """)
 
 def compute_daily_trending(**context):
-    execution_date = context["execution_date"]
-    report_date = execution_date.date()
+    report_date = datetime.utcnow().date()
     start = datetime.combine(report_date, datetime.min.time())
     end = start + timedelta(days=1)
 
