@@ -195,7 +195,12 @@ services:
         condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
-    environment: *airflow-common-env
+      trino:
+        condition: service_healthy
+    environment:
+      <<: *airflow-common-env
+      TRINO_HOST: trino
+      TRINO_PORT: "8080"
     volumes:
       - ./airflow/dags:/opt/airflow/dags
     ports:
@@ -211,7 +216,13 @@ services:
         condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
-    environment: *airflow-common-env
+      trino:
+        condition: service_healthy
+    
+    environment:
+      <<: *airflow-common-env
+      TRINO_HOST: trino
+      TRINO_PORT: "8080"
     volumes:
       - ./airflow/dags:/opt/airflow/dags
     command: scheduler
