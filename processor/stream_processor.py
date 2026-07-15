@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import pandas as pd
 import numpy as np
 import logging
@@ -10,7 +11,10 @@ from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, DoubleType, IntegerType, TimestampType
 )
 from pyspark.sql.streaming.state import GroupState, GroupStateTimeout
+from pyspark.sql.streaming import StreamingQueryListener
+
 import clickhouse_driver
+from prometheus_client import start_http_server, Gauge
 
 # --- 配置區 ---
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:29092")
@@ -52,6 +56,42 @@ PLAY_FACT_SCHEMA = StructType([
     StructField("is_valid", IntegerType(), True),     
     StructField("event_timestamp", TimestampType(), True)
 ])
+
+# Prometheus 指標定義
+BATCH_DURATION = Gauge('spark_batch_duration_ms', 'Spark batch duration in ms')
+INPUT_ROWS_PER_SEC = Gauge('spark_input_rows_per_second', 'Input rows per second from Kafka')
+PROCESSED_ROWS_PER_SEC = Gauge('spark_processed_rows_per_second', 'Processed rows per second')
+KAFKA_START_OFFSET = Gauge('spark_kafka_start_offset', 'Kafka start offset per batch')
+KAFKA_END_OFFSET = Gauge('spark_kafka_end_offset', 'Kafka end offset per batch')
+
+
+class PrometheusStreamingListener(StreamingQueryListener):
+    def onQueryStarted(self, event):
+        logger.info(f"Streaming query started: {event.id}")
+
+    def onQueryProgress(self, event):
+        progress = event.progress
+        BATCH_DURATION.set(progress.batchDuration)
+        INPUT_ROWS_PER_SEC.set(progress.inputRowsPerSecond)
+        PROCESSED_ROWS_PER_SEC.set(progress.processedRowsPerSecond)
+
+        sources = progress.sources
+        if sources:
+            source = sources[0]
+            try:
+                if source.startOffset:
+                    start = json.loads(source.startOffset)
+                    offset_val = list(list(start.values())[0].values())[0]
+                    KAFKA_START_OFFSET.set(offset_val)
+                if source.endOffset:
+                    end = json.loads(source.endOffset)
+                    offset_val = list(list(end.values())[0].values())[0]
+                    KAFKA_END_OFFSET.set(offset_val)
+            except Exception as e:
+                logger.warning(f"Failed to parse offsets: {e}")
+
+    def onQueryTerminated(self, event):
+        logger.info(f"Streaming query terminated: {event.id}")
 
 def create_spark_session():
     spark_master = os.environ.get("SPARK_MASTER", "local[*]")
@@ -189,9 +229,15 @@ def write_to_clickhouse(batch_df, batch_id):
 
 def main():
     init_clickhouse()
+    start_http_server(8888)
+    logger.info("Prometheus metrics server started on port 8888")
+    
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
-
+    
+    # 註冊 listener
+    spark.streams.addListener(PrometheusStreamingListener())
+    
     raw_df = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", KAFKA_BROKER) \

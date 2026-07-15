@@ -79,12 +79,12 @@ services:
       - SPARK_WORKER_CORES=1
       - PYSPARK_PYTHON=/usr/bin/python3
     volumes:
-      - spark_checkpoint_v7:/tmp/spark-checkpoint-v7
+      - spark_checkpoint:/tmp/spark-checkpoint
     user: "root"
     depends_on:
       spark:
         condition: service_healthy
-    
+
   producer:
     build:
       context: .
@@ -110,13 +110,14 @@ services:
       - KAFKA_BROKER=kafka:29092
       - CLICKHOUSE_HOST=clickhouse
       - SPARK_MASTER=spark://spark:7077
-      - CHECKPOINT_DIR=/tmp/spark-checkpoint-v7
+      - CHECKPOINT_DIR=/tmp/spark-checkpoint
     volumes:
-      - spark_checkpoint_v7:/tmp/spark-checkpoint-v7
+      - spark_checkpoint:/tmp/spark-checkpoint
     user: "root"
     ports:
       - "4040:4040"
-  
+      - "8888:8888"
+
   api:
     build:
       context: .
@@ -143,7 +144,6 @@ services:
       interval: 5s
       retries: 5
 
-  # 一次性初始化：跑 db migrate + 建立固定帳密的 admin 帳號，跑完即結束
   airflow-init:
     build:
       context: ./airflow
@@ -155,7 +155,6 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      # 固定值，避免每次重啟隨機產生 → 之前加密的資料讀不出來 / session 全部失效
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A=}
       AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY:-please-change-me-too}
     volumes:
@@ -203,6 +202,59 @@ services:
       - ./airflow/dags:/opt/airflow/dags
     command: scheduler
 
+  # --- 監控 ---
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    depends_on:
+      - kafka-exporter
+      - clickhouse-exporter
+      - node-exporter
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    command:
+      - '--kafka.server=kafka:29092'
+      - '--verbosity=10'
+    ports:
+      - "9308:9308"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: on-failure
+
+  clickhouse-exporter:
+    image: f1yegor/clickhouse-exporter:latest
+    environment:
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+    command:
+      - '-scrape_uri=http://clickhouse:8123/'
+    ports:
+      - "9116:9116"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    ports:
+      - "9100:9100"
+
 volumes:
   clickhouse_data:
-  spark_checkpoint_v7:
+  spark_checkpoint:

@@ -18,7 +18,8 @@ RUN pip install --no-cache-dir \
     clickhouse-driver==0.2.6 \
     pandas==1.5.3 \
     pyarrow==11.0.0 \
-    kafka-python==2.0.2
+    kafka-python==2.0.2 \
+    prometheus_client==0.20.0
 
 COPY processor/stream_processor.py .
 
