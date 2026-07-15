@@ -35,9 +35,9 @@ def get_top_tracks(
     client = get_clickhouse_client()
 
     if window == "1h":
-        time_filter = "window_start >= toTimeZone(now(), 'Asia/Taipei') - INTERVAL 1 HOUR"
+        time_filter = "window_start >= now() - INTERVAL 1 HOUR"
     else:
-        time_filter = "window_start >= toTimeZone(now(), 'Asia/Taipei') - INTERVAL 1 DAY"
+        time_filter = "window_start >= now() - INTERVAL 1 DAY"
 
     query = f"""
         SELECT
