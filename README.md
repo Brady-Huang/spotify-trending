@@ -1,4 +1,3 @@
-
 # Spotify Trending Songs — Real-Time Data Pipeline
 
 A production-grade real-time data pipeline simulating Spotify's trending songs system, based on the system design from [Build Moat](https://buildmoat.org).
@@ -110,6 +109,25 @@ Producer simulates real-world traffic distribution:
 | Cache | Redis | Query result caching (cache-aside) |
 | API | FastAPI | Top K query endpoint |
 | Batch Scheduler | Airflow | Daily trending report pipeline |
+| Monitoring | Prometheus + Grafana | Metrics collection and visualization |
+
+## Monitoring
+
+The pipeline is monitored with Prometheus and Grafana. Metrics are collected from Kafka, ClickHouse, the host system, and Spark Structured Streaming via a custom `StreamingQueryListener`.
+
+> **Note:** Spark Structured Streaming does not register a consumer group with Kafka — it manages offsets via checkpoint. Traditional Kafka monitoring tools (e.g. Burrow, kafka-exporter) cannot observe consumer lag from the broker side. The `StreamingQueryListener` is the correct solution, exposing `startOffset` and `endOffset` per batch so lag can be derived directly from Spark.
+
+**Spark Streaming Dashboard** — batch duration, consumer lag, input/processed rows/sec, ClickHouse insert rate, CPU usage
+
+![Spark Streaming Dashboard](docs/images/grafana-spark-dashboard.png)
+
+**Node Exporter Dashboard** — CPU, memory, disk, network
+
+![Node Exporter Dashboard](docs/images/grafana-node-dashboard.png)
+
+**ClickHouse Dashboard** — query rate, merge activity, read/write, compressed buffer
+
+![ClickHouse Dashboard](docs/images/grafana-clickhouse-dashboard.png)
 
 ## API Endpoints
 
@@ -234,6 +252,13 @@ ORDER BY rank ASC
 
 Open http://localhost:8090, find `daily_trending`, and trigger it manually — no need to wait until 1AM to see batch results. Once complete, run the `daily_trending` query above in ClickHouse Play to verify the output.
 
+**7. View monitoring dashboards**
+
+Open http://localhost:3000 (Grafana) with `admin / admin`. Import dashboards:
+- Spark Streaming Dashboard (custom, see `monitoring/`)
+- Node Exporter Full: ID `1860`
+- ClickHouse: ID `882`
+
 ### Service URLs
 
 | Service | URL |
@@ -244,6 +269,8 @@ Open http://localhost:8090, find `daily_trending`, and trigger it manually — n
 | Spark Application UI | http://localhost:4040 |
 | Airflow UI | http://localhost:8090 |
 | ClickHouse | http://localhost:8123 |
+| Grafana | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
 
 ### Stop
 ```bash
@@ -275,6 +302,10 @@ spotify-trending/
 │       └── daily_trending.py  # Daily batch DAG for trending report
 ├── spark/
 │   └── Dockerfile           # Custom Spark image with Python dependencies
+├── monitoring/
+│   └── prometheus.yml       # Prometheus scrape config
+├── docs/
+│   └── images/              # Dashboard screenshots
 ├── terraform/
 │   ├── main.tf              # GCP resources (VPC, VM, GCS, firewall)
 │   ├── variables.tf
