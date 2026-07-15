@@ -6,9 +6,24 @@ logger = logging.getLogger("SpotifyProcessor")
 
 CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "clickhouse")
 
-
 def init_clickhouse():
     client = clickhouse_driver.Client(host=CLICKHOUSE_HOST)
+    
+    client.execute("""
+        CREATE TABLE IF NOT EXISTS play_facts (
+            session_id      String,
+            user_id         String,
+            track_id        String,
+            title           String,
+            genre           String,
+            country         String,
+            is_valid        UInt8,
+            event_timestamp DateTime64(3, 'Asia/Taipei')
+        ) ENGINE = MergeTree()
+        ORDER BY (event_timestamp, country, genre)
+        TTL toDate(event_timestamp) + INTERVAL 7 DAY
+    """)
+
     client.execute("""
         CREATE MATERIALIZED VIEW IF NOT EXISTS play_counts_1m
         ENGINE = SummingMergeTree()
