@@ -18,7 +18,7 @@ def init_clickhouse():
             genre           String,
             country         String,
             is_valid        UInt8,
-            event_timestamp DateTime64(3, 'Asia/Taipei')
+            event_timestamp DateTime64(3, 'UTC')
         ) ENGINE = MergeTree()
         ORDER BY (event_timestamp, country, genre)
         TTL toDate(event_timestamp) + INTERVAL 7 DAY

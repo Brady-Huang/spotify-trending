@@ -83,11 +83,9 @@ def update_session_state(session_id, pdf_iterator, state: GroupState):
         for row in df.itertuples():
             raw_ts = getattr(row, 'timestamp', None)
             if raw_ts:
-                event_ts = pd.to_datetime(float(raw_ts), unit='s', utc=True) \
-                            .tz_convert('Asia/Taipei') \
-                            .tz_localize(None)
+                event_ts = pd.to_datetime(float(raw_ts), unit='s', utc=True).tz_localize(None)
             else:
-                event_ts = pd.Timestamp.now()
+                event_ts = pd.Timestamp.utcnow()
 
             current_state = getattr(row, 'state', None)
             if current_state == "play":
