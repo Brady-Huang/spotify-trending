@@ -9,6 +9,7 @@ CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "clickhouse")
 def init_clickhouse():
     client = clickhouse_driver.Client(host=CLICKHOUSE_HOST)
     
+    # Raw play events, 7-day TTL for hot/cold tiering
     client.execute("""
         CREATE TABLE IF NOT EXISTS play_facts (
             session_id      String,
@@ -24,10 +25,23 @@ def init_clickhouse():
         TTL toDate(event_timestamp) + INTERVAL 7 DAY
     """)
 
+    # Target table for materialized view aggregation
     client.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS play_counts_1m
-        ENGINE = SummingMergeTree()
-        ORDER BY (window_start, track_id, country, genre)
+        CREATE TABLE IF NOT EXISTS play_counts_1m (
+            window_start DateTime('UTC'),
+            track_id      String,
+            title         String,
+            genre         String,
+            country       String,
+            play_count    UInt64
+        ) ENGINE = SummingMergeTree()
+        ORDER BY (window_start, track_id, title, country, genre)
+    """)
+
+    # Materialized view: auto-aggregates play_facts into play_counts_1m on every insert
+    client.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS play_counts_1m_mv
+        TO play_counts_1m
         AS SELECT
             toStartOfMinute(event_timestamp) AS window_start,
             track_id,
@@ -39,6 +53,7 @@ def init_clickhouse():
         WHERE is_valid = 1
         GROUP BY window_start, track_id, title, genre, country
     """)
+
     logger.info("[ClickHouse] Tables ready ✅")
 
 
@@ -66,7 +81,7 @@ def write_to_clickhouse(batch_df, batch_id):
                 data
             )
 
-    # 使用 foreachPartition 防止 Driver 記憶體爆炸
+    # Use foreachPartition to batch inserts and avoid driver OOM
     batch_df.foreachPartition(send_to_clickhouse)
     if row_count > 0:
         logger.info(f"🚀 [Batch {batch_id}] Successfully wrote {row_count} rows to ClickHouse.")
