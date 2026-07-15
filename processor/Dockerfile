@@ -21,6 +21,6 @@ RUN pip install --no-cache-dir \
     kafka-python==2.0.2 \
     prometheus_client==0.20.0
 
-COPY processor/stream_processor.py .
+COPY processor/ .
 
 CMD ["python", "stream_processor.py"]

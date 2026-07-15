@@ -1,29 +1,23 @@
 import os
-import time
-import json
 import pandas as pd
-import numpy as np
 import logging
-from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, DoubleType, IntegerType, TimestampType
 )
 from pyspark.sql.streaming.state import GroupState, GroupStateTimeout
-from pyspark.sql.streaming import StreamingQueryListener
 
-import clickhouse_driver
-from prometheus_client import start_http_server, Gauge
+from metrics import PrometheusStreamingListener, start_metrics_server
+from clickhouse_writer import init_clickhouse, write_to_clickhouse
+from iceberg_writer import configure_iceberg, init_iceberg, write_to_iceberg
 
 # --- 配置區 ---
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:29092")
 KAFKA_TOPIC = "play-events"
-CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "clickhouse")
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "/tmp/spark-checkpoint")
 PLAY_THRESHOLD_MS = 30000
 
-# 設定日誌格式：時間 - 層級 - 訊息
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -31,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SpotifyProcessor")
 
-# 1. 定義 Kafka 輸入 Schema
+# Kafka 輸入 Schema
 EVENT_SCHEMA = StructType([
     StructField("event_id", StringType()),
     StructField("session_id", StringType()),
@@ -45,7 +39,7 @@ EVENT_SCHEMA = StructType([
     StructField("timestamp", DoubleType()),
 ])
 
-# 2. 定義 輸出到 ClickHouse 的 Schema
+# 輸出 Schema
 PLAY_FACT_SCHEMA = StructType([
     StructField("session_id", StringType(), True),
     StructField("user_id", StringType(), True),
@@ -53,56 +47,26 @@ PLAY_FACT_SCHEMA = StructType([
     StructField("title", StringType(), True),
     StructField("genre", StringType(), True),
     StructField("country", StringType(), True),
-    StructField("is_valid", IntegerType(), True),     
+    StructField("is_valid", IntegerType(), True),
     StructField("event_timestamp", TimestampType(), True)
 ])
 
-# Prometheus 指標定義
-BATCH_DURATION = Gauge('spark_batch_duration_ms', 'Spark batch duration in ms')
-INPUT_ROWS_PER_SEC = Gauge('spark_input_rows_per_second', 'Input rows per second from Kafka')
-PROCESSED_ROWS_PER_SEC = Gauge('spark_processed_rows_per_second', 'Processed rows per second')
-KAFKA_START_OFFSET = Gauge('spark_kafka_start_offset', 'Kafka start offset per batch')
-KAFKA_END_OFFSET = Gauge('spark_kafka_end_offset', 'Kafka end offset per batch')
-
-
-class PrometheusStreamingListener(StreamingQueryListener):
-    def onQueryStarted(self, event):
-        logger.info(f"Streaming query started: {event.id}")
-
-    def onQueryProgress(self, event):
-        progress = event.progress
-        BATCH_DURATION.set(progress.batchDuration)
-        INPUT_ROWS_PER_SEC.set(progress.inputRowsPerSecond)
-        PROCESSED_ROWS_PER_SEC.set(progress.processedRowsPerSecond)
-
-        sources = progress.sources
-        if sources:
-            source = sources[0]
-            try:
-                if source.startOffset:
-                    start = json.loads(source.startOffset)
-                    offset_val = list(list(start.values())[0].values())[0]
-                    KAFKA_START_OFFSET.set(offset_val)
-                if source.endOffset:
-                    end = json.loads(source.endOffset)
-                    offset_val = list(list(end.values())[0].values())[0]
-                    KAFKA_END_OFFSET.set(offset_val)
-            except Exception as e:
-                logger.warning(f"Failed to parse offsets: {e}")
-
-    def onQueryTerminated(self, event):
-        logger.info(f"Streaming query terminated: {event.id}")
 
 def create_spark_session():
     spark_master = os.environ.get("SPARK_MASTER", "local[*]")
     return SparkSession.builder \
         .appName("SpotifyTrendingProcessor") \
         .master(spark_master) \
-        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3") \
+        .config("spark.jars.packages",
+                "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,"
+                "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.0,"
+                "software.amazon.awssdk:bundle:2.20.18,"
+                "org.apache.hadoop:hadoop-aws:3.3.4") \
         .config("spark.sql.shuffle.partitions", "4") \
         .config("spark.streaming.backpressure.enabled", "true") \
         .config("spark.streaming.backpressure.initialRate", "1000") \
         .getOrCreate()
+
 
 def update_session_state(session_id, pdf_iterator, state: GroupState):
     s_id = str(session_id[0]) if isinstance(session_id, tuple) else str(session_id)
@@ -119,7 +83,6 @@ def update_session_state(session_id, pdf_iterator, state: GroupState):
         for row in df.itertuples():
             raw_ts = getattr(row, 'timestamp', None)
             if raw_ts:
-                # 先轉為 UTC，再轉為台北時區，最後移除時區標籤以符合 Spark TimestampType
                 event_ts = pd.to_datetime(float(raw_ts), unit='s', utc=True) \
                             .tz_convert('Asia/Taipei') \
                             .tz_localize(None)
@@ -165,85 +128,33 @@ def update_session_state(session_id, pdf_iterator, state: GroupState):
         if results:
             yield pd.DataFrame(results)[cols]
 
-def init_clickhouse():
-    client = clickhouse_driver.Client(host=CLICKHOUSE_HOST)
-    client.execute("""
-        CREATE TABLE IF NOT EXISTS play_facts (
-            session_id      String,
-            user_id         String,
-            track_id        String,
-            title           String,
-            genre           String,
-            country         String,
-            is_valid        UInt8,
-            event_timestamp DateTime64(3, 'Asia/Taipei')
-        ) ENGINE = MergeTree()
-        ORDER BY (event_timestamp, country, genre)
-    """)
-    client.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS play_counts_1m
-        ENGINE = SummingMergeTree()
-        ORDER BY (window_start, track_id, country, genre)
-        AS SELECT
-            toStartOfMinute(event_timestamp) AS window_start,
-            track_id,
-            title,
-            genre,
-            country,
-            count() AS play_count
-        FROM play_facts
-        WHERE is_valid = 1
-        GROUP BY window_start, track_id, title, genre, country
-    """)
-    logger.info("[ClickHouse] Tables ready ✅")
 
-def write_to_clickhouse(batch_df, batch_id):
-    row_count = batch_df.count()
+def write_to_all(batch_df, batch_id):
+    """同時寫入 ClickHouse 和 Iceberg"""
+    batch_df.cache()
+    write_to_clickhouse(batch_df, batch_id)
+    write_to_iceberg(batch_df, batch_id)
+    batch_df.unpersist()
 
-    def send_to_clickhouse(partition_iterator):
-        client = clickhouse_driver.Client(host=CLICKHOUSE_HOST)
-        data = []
-        for r in partition_iterator:
-            data.append({
-                "session_id": r.session_id,
-                "user_id": r.user_id,
-                "track_id": r.track_id,
-                "title": r.title,
-                "genre": r.genre,
-                "country": r.country,
-                "is_valid": r.is_valid,
-                "event_timestamp": r.event_timestamp
-            })
-        if data:
-            client.execute(
-                "INSERT INTO play_facts (session_id, user_id, track_id, title, genre, country, is_valid, event_timestamp) VALUES",
-                data
-            )
-    
-    # 使用 foreachPartition 防止 Driver 記憶體爆炸
-    batch_df.foreachPartition(send_to_clickhouse)
-    if row_count > 0:
-        logger.info(f"🚀 [Batch {batch_id}] Successfully wrote {row_count} rows to ClickHouse.")
-    else:
-        logger.info(f"💤 [Batch {batch_id}] No data to process.")
 
 def main():
     init_clickhouse()
-    start_http_server(8888)
-    logger.info("Prometheus metrics server started on port 8888")
-    
+    start_metrics_server(8888)
+
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
-    
-    # 註冊 listener
+
+    configure_iceberg(spark)
+    init_iceberg(spark)
+
     spark.streams.addListener(PrometheusStreamingListener())
-    
+
     raw_df = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", KAFKA_BROKER) \
         .option("subscribe", KAFKA_TOPIC) \
         .option("startingOffsets", "earliest") \
-        .option("maxOffsetsPerTrigger", "2000")\
+        .option("maxOffsetsPerTrigger", "2000") \
         .option("failOnDataLoss", "false") \
         .load()
 
@@ -251,7 +162,6 @@ def main():
         from_json(col("value").cast("string"), EVENT_SCHEMA).alias("data")
     ).select("data.*")
 
-    # 狀態處理：確保 groupBy 後進行狀態運算
     play_facts_df = events_df \
         .groupBy("session_id") \
         .applyInPandasWithState(
@@ -263,13 +173,14 @@ def main():
         )
 
     query = play_facts_df.writeStream \
-        .foreachBatch(write_to_clickhouse) \
+        .foreachBatch(write_to_all) \
         .outputMode("update") \
         .option("checkpointLocation", CHECKPOINT_DIR) \
         .trigger(processingTime="10 seconds") \
         .start()
 
     query.awaitTermination()
+
 
 if __name__ == "__main__":
     main()
