@@ -1,6 +1,6 @@
 # Spotify Trending Songs — Real-Time Data Pipeline
 
-A production-grade real-time data pipeline simulating Spotify's trending songs system, based on the system design from [Build Moat](https://buildmoat.org).
+A production-grade real-time data pipeline simulating Spotify's trending songs system.
 
 📄 **[Design Deep Dive](docs/DESIGN.md)** — detailed architecture diagram, system design, key design decisions (idempotency, dual-sink streaming, Silver layer reconciliation), and full schemas.
 
