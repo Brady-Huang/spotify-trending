@@ -2,142 +2,33 @@
 
 A production-grade real-time data pipeline simulating Spotify's trending songs system, based on the system design from [Build Moat](https://buildmoat.org).
 
-## System Architecture
+📄 **[Design Deep Dive](docs/DESIGN.md)** — detailed architecture diagram, system design, key design decisions (idempotency, dual-sink streaming, Silver layer reconciliation), and full schemas.
 
-**Streaming (Real-time):**
-```
-Producer → Kafka → Spark Structured Streaming → ClickHouse (play_counts_1m) → Redis Cache → FastAPI
-                                              → Iceberg on MinIO (play_facts, historical)
-```
+## Architecture
 
-**Batch (Daily):**
+**Streaming (Real-time) — two independent streaming queries sharing the same Kafka source:**
 ```
-Airflow DAG (daily @ 1AM) → Trino → Iceberg (play_facts) → ClickHouse (daily_trending) → FastAPI
-```
-
-### Architecture Diagram
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────────────────┐
-│   Producer  │────▶│    Kafka    │────▶│  Spark Structured       │
-│  (Python)   │     │  (Message   │     │  Streaming (Processor)  │
-└─────────────┘     │   Queue)    │     │  - Deduplication        │
-                    └─────────────┘     │  - Session Tracking     │
-                                        │  - 30s Play Threshold   │
-                                        └────────┬────────────────┘
-                                                 │
-                                    ┌────────────┴────────────┐
-                                    ▼                         ▼
-                         ┌─────────────────┐      ┌─────────────────┐
-                         │   ClickHouse    │      │  Iceberg on     │
-                         │  play_facts     │      │  MinIO          │
-                         │  (7-day TTL)    │      │  play_facts     │
-                         │  play_counts_1m │      │  (永久保留)      │
-                         │  daily_trending │      └────────┬────────┘
-                         └────────┬────────┘               │
-                                  │                         ▼
-                                  │               ┌─────────────────┐
-                                  │               │     Trino       │
-                                  │               └────────┬────────┘
-                                  │                        │
-                                  │               ┌────────▼────────┐
-                                  │               │  Airflow DAG    │
-                                  │               │  (daily @ 1AM)  │
-                                  │               └────────┬────────┘
-                                  │                        │
-                                  │◀───────────────────────┘
-                                  │
-                    ┌─────────────┘
-                    ▼
-          ┌─────────────────┐
-          │  Redis Cache    │
-          └────────┬────────┘
-                   │
-                   ▼
-          ┌─────────────────┐
-          │    FastAPI      │
-          │  (Top K API)    │
-          └─────────────────┘
+                    ┌─▶ [Bronze sink]      Spark (stateless, append)      → Iceberg raw_events (MERGE INTO, event_id dedup, permanent)
+Producer → Kafka ──┤
+                    └─▶ [Serving sink]     Spark (applyInPandasWithState) → ClickHouse play_facts (probabilistic dedup, 7-day TTL)
+                                                                            → play_counts_1m (MV) → Redis Cache → FastAPI
 ```
 
-## System Design
+**Batch (Daily) — Silver layer recompute, then Gold layer aggregate:**
+```
+Airflow DAG (daily @ 1AM) → Trino → Iceberg raw_events (Bronze)
+                           → MERGE INTO Iceberg play_facts_historical (Silver, re-derived is_valid)
+                           → ClickHouse daily_trending (Gold) → FastAPI
+```
 
-### Functional Requirements
-1. Collect listening metrics from clients
-2. Provide Top K songs by different dimensions (country, genre)
-3. Generate daily trending report
+## Key Design Highlights
 
-### Non-Functional Requirements
-1. High accuracy — count a play only after 30 seconds of listening
-2. Low latency — Top K results updated every minute via Materialized View
+A few of the more interesting decisions — full writeups in [docs/DESIGN.md](docs/DESIGN.md#key-design-decisions):
 
-### Production Considerations
-1. Scale to 700M MAUs (~1.2M events/sec) — requires horizontal scaling of Kafka partitions, Spark executors, and ClickHouse shards
-2. Generate Top K results ASAP after each hour/day ends — would require windowed aggregation triggers rather than fixed 1AM batch
-
-### Key Design Decisions
-
-#### Effective Play Count
-Following Spotify's official definition, a stream is counted when a listener plays a song for at least 30 seconds.
-
-Implemented via Spark `applyInPandasWithState`:
-- Per-session state tracks `accumulated_ms`
-- PlayFact emitted once when `accumulated_ms >= 30,000ms`
-- `play_fact_emitted` flag prevents duplicate counting within the same session
-
-`applyInPandasWithState` was chosen over `mapGroupsWithState` because it allows yielding multiple rows per group update and integrates naturally with pandas, making the session logic easier to reason about.
-
-#### Hot / Cold Data Tiering
-Raw `play_facts` are written to two destinations simultaneously:
-
-- **ClickHouse** (`play_facts`, 7-day TTL) — serves as the source for `play_counts_1m` Materialized View, enabling real-time Top K queries with low latency
-- **Iceberg on MinIO** (`play_facts`, permanent) — long-term historical storage, queried by Trino for the daily batch pipeline
-
-This separation keeps ClickHouse lean (only recent data) while preserving full history in the lakehouse for analytics.
-
-#### Lakehouse Architecture
-Iceberg on MinIO provides an open table format for historical data:
-- **Open standard** — Spark writes, Trino reads, no vendor lock-in
-- **Partitioned** by `days(event_timestamp)` and `country` for efficient time-range and country-level queries
-- **REST Catalog** (`tabulario/iceberg-rest`) manages table metadata, simpler than Hive Metastore for self-hosted setups
-
-#### Writing to ClickHouse via `foreachPartition`
-Rather than using `foreach` (which creates one connection per row), the processor uses `foreachPartition` to batch all rows in a partition into a single INSERT. This avoids driver OOM issues and reduces connection overhead significantly.
-
-#### OLAP Storage
-ClickHouse with column-oriented storage for efficient analytical queries:
-- `play_facts` — raw PlayFact events (7-day TTL, source for Materialized View)
-- `play_counts_1m` — Materialized View aggregated by minute using `SummingMergeTree`
-- `daily_trending` — pre-aggregated daily Top 10 by country and genre, populated by Airflow via Trino
-
-ClickHouse was chosen over cloud-native OLAP (e.g. BigQuery) because this project is designed to be fully self-hosted and runnable with a single `docker compose up`. In a production cloud environment, BigQuery or Redshift would be natural alternatives.
-
-#### Redis Cache (Cache-Aside Pattern)
-FastAPI uses a cache-aside pattern with 60s TTL:
-1. Check Redis for cached result
-2. On cache miss, query ClickHouse and write result to Redis
-3. Subsequent requests within TTL are served from Redis
-
-This avoids repeated ClickHouse aggregation queries for the same Top K parameters.
-
-#### Airflow Batch Pipeline
-A daily Airflow DAG runs at 1AM to compute the previous day's Top 10 trending songs:
-- `check_connections` — verifies both ClickHouse and Trino are reachable
-- `create_daily_trending_table` — idempotent table creation
-- `compute_daily_trending` — queries `iceberg.spotify.play_facts` via Trino, writes results to ClickHouse `daily_trending`
-
-Using Trino to query Iceberg separates the batch analytics path from the real-time query path, keeping ClickHouse focused on low-latency serving.
-
-#### Spark Consumer Lag Monitoring
-Spark Structured Streaming does not register a consumer group with Kafka — it manages offsets via checkpoint. Traditional Kafka monitoring tools (e.g. Burrow, kafka-exporter) cannot observe consumer lag from the broker side.
-
-A custom `StreamingQueryListener` exposes `startOffset` and `endOffset` per batch to Prometheus, allowing consumer lag to be derived as `kafka_current_offset - spark_end_offset`.
-
-#### Hot Shard Simulation
-Producer simulates real-world traffic distribution:
-- US: 28%, BR: 10%, UK: 8%, TW: 2%, etc.
-- Demonstrates the hot shard problem where high-volume partitions cause uneven Kafka consumer load
-- Production mitigation: salting (adding random suffix to partition key) to distribute hot keys across multiple partitions
+- **[Dual Sink from a Single Kafka Source](docs/DESIGN.md#dual-sink-from-a-single-kafka-source)** — Bronze (lossless, stateless) and serving (best-effort, stateful) run as two independent streaming queries so a problem in one can't compromise the other.
+- **[Idempotent Writes](docs/DESIGN.md#idempotent-writes)** — Iceberg uses exact row-level dedup via `MERGE INTO` on `event_id`; ClickHouse uses block-level probabilistic dedup via `non_replicated_deduplication_window`. Both verified with kill tests.
+- **[Silver Layer Batch Recomputation](docs/DESIGN.md#silver-layer-batch-recomputation)** — the real-time `is_valid` isn't authoritative; a daily Airflow job re-derives it from the complete Bronze history via `MERGE INTO` upsert.
+- **[Why MV dedup has to happen before the write](docs/DESIGN.md#olap-storage)** — `SummingMergeTree` only adds and can't be corrected retroactively, so `insert_deduplication` has to stop duplicates before they ever reach `play_facts`.
 
 ## Components
 
@@ -147,7 +38,7 @@ Producer simulates real-world traffic distribution:
 | Message Queue | Kafka + Zookeeper | Event buffer and delivery |
 | Stream Processor | PySpark Structured Streaming | Dedup + session tracking + PlayFact |
 | OLAP | ClickHouse | Real-time aggregated Top K storage (7-day TTL) |
-| Lakehouse | Iceberg on MinIO | Historical play_facts (permanent) |
+| Lakehouse | Iceberg on MinIO | Bronze `raw_events` + Silver `play_facts_historical` (permanent) |
 | Query Engine | Trino | SQL queries on Iceberg for batch pipeline |
 | Cache | Redis | Query result caching (cache-aside) |
 | API | FastAPI | Top K query endpoint |
@@ -156,7 +47,7 @@ Producer simulates real-world traffic distribution:
 
 ## Monitoring
 
-The pipeline is monitored with Prometheus and Grafana. Metrics are collected from Kafka, ClickHouse, the host system, and Spark Structured Streaming via a custom `StreamingQueryListener`.
+The pipeline is monitored with Prometheus and Grafana. Metrics are collected from Kafka, ClickHouse, the host system, and Spark Structured Streaming via a custom `StreamingQueryListener` (see [docs/DESIGN.md](docs/DESIGN.md#spark-consumer-lag-monitoring) for why this is needed).
 
 **Spark Streaming Dashboard** — batch duration, consumer lag, input/processed rows/sec, ClickHouse insert rate, CPU usage
 
@@ -213,11 +104,13 @@ curl "http://localhost:8000/top_tracks?dim=country&num_tracks=10&window=1h"
 Once all services are up, the pipeline runs automatically:
 
 1. **Producer** continuously sends simulated play events to Kafka
-2. **Spark** consumes from Kafka, tracks each session's listening time, and emits a PlayFact once a user has listened for 30 seconds
+2. **Spark** runs two independent streaming queries off the same Kafka topic:
+   - Bronze sink: writes every raw event to Iceberg `raw_events`, no logic applied
+   - Serving sink: tracks each session's listening time and emits a PlayFact to ClickHouse once a user has listened for 30 seconds
 3. **ClickHouse** stores the PlayFacts and aggregates them by minute via a Materialized View; raw data expires after 7 days
-4. **Iceberg on MinIO** stores all PlayFacts permanently for historical analysis
+4. **Iceberg on MinIO** stores all raw events permanently in `raw_events` (Bronze)
 5. **FastAPI** serves real-time Top K queries, backed by Redis cache
-6. **Airflow** runs a daily batch job at 1AM — queries Iceberg via Trino, writes Top 10 to ClickHouse
+6. **Airflow** runs a daily batch job at 1AM — recomputes `is_valid` from `raw_events` into `play_facts_historical` (Silver) via Trino, then writes Top 10 to ClickHouse `daily_trending` (Gold)
 
 ### Prerequisites
 - Docker + Docker Compose
@@ -283,8 +176,12 @@ ORDER BY rank ASC
 
 **6. Query Iceberg via Trino**
 ```bash
-docker compose exec trino trino --execute "SELECT count(*) FROM iceberg.spotify.play_facts"
-docker compose exec trino trino --execute "SELECT country, count(*) as plays FROM iceberg.spotify.play_facts GROUP BY country ORDER BY plays DESC LIMIT 5"
+docker compose exec trino trino --execute "SELECT count(*) FROM iceberg.spotify.raw_events"
+docker compose exec trino trino --execute "SELECT country, count(*) as plays FROM iceberg.spotify.raw_events GROUP BY country ORDER BY plays DESC LIMIT 5"
+
+# Verify Iceberg idempotency: total rows should equal distinct event_id — no duplicates,
+# even across Spark retries/kill tests
+docker compose exec trino trino --execute "SELECT count(*) AS total, count(DISTINCT event_id) AS distinct_events FROM iceberg.spotify.raw_events"
 ```
 
 **7. Trigger the daily batch DAG manually**
@@ -303,7 +200,7 @@ Open http://localhost:3000 (Grafana) with `admin / admin`. Import dashboards:
 
 **9. Explore MinIO**
 
-Open http://localhost:9001 with `minioadmin / minioadmin`. Browse `warehouse/spotify/play_facts/` to see Iceberg `data/` and `metadata/` directories.
+Open http://localhost:9001 with `minioadmin / minioadmin`. Browse `warehouse/spotify/raw_events/` to see Iceberg `data/` and `metadata/` directories.
 
 ### Service URLs
 
@@ -333,6 +230,7 @@ docker compose up -d
 > **Note:** Checkpoint data is persisted in Docker volumes. On restart, the stream processor will resume from the last committed Kafka offset.
 
 ## Project Structure
+
 ```
 spotify-trending/
 ├── producer/
@@ -350,7 +248,7 @@ spotify-trending/
 ├── airflow/
 │   ├── Dockerfile
 │   └── dags/
-│       └── daily_trending.py  # Queries Iceberg via Trino, writes to ClickHouse
+│       └── spotify_batch_pipeline.py  # Recomputes Silver from raw_events, writes daily_trending to ClickHouse
 ├── spark/
 │   └── Dockerfile
 ├── trino/
@@ -359,6 +257,7 @@ spotify-trending/
 ├── monitoring/
 │   └── prometheus.yml
 ├── docs/
+│   ├── DESIGN.md
 │   └── images/
 ├── terraform/
 │   ├── main.tf
@@ -367,70 +266,6 @@ spotify-trending/
 │   └── startup.sh
 ├── docker-compose.yml
 └── README.md
-```
-
-## ClickHouse Schema
-
-### play_facts (Hot Storage, 7-day TTL)
-```sql
-CREATE TABLE play_facts (
-    session_id      String,
-    user_id         String,
-    track_id        String,
-    title           String,
-    genre           String,
-    country         String,
-    is_valid        UInt8,
-    event_timestamp DateTime64(3, 'Asia/Taipei')
-) ENGINE = MergeTree()
-ORDER BY (event_timestamp, country, genre)
-TTL toDate(event_timestamp) + INTERVAL 7 DAY
-```
-
-### play_counts_1m (Materialized View)
-```sql
-CREATE MATERIALIZED VIEW play_counts_1m
-ENGINE = SummingMergeTree()
-ORDER BY (window_start, track_id, country, genre)
-AS SELECT
-    toStartOfMinute(event_timestamp) AS window_start,
-    track_id, title, genre, country,
-    count() AS play_count
-FROM play_facts
-WHERE is_valid = 1
-GROUP BY window_start, track_id, title, genre, country
-```
-
-### daily_trending (Batch Output)
-```sql
-CREATE TABLE daily_trending (
-    report_date     Date,
-    dimension_type  String,
-    dimension_value String,
-    track_id        String,
-    title           String,
-    total_plays     UInt64,
-    rank            UInt32
-) ENGINE = MergeTree()
-ORDER BY (report_date, dimension_type, rank)
-```
-
-## Iceberg Schema
-
-### play_facts (Cold Storage, Permanent)
-```sql
-CREATE TABLE iceberg.spotify.play_facts (
-    session_id      STRING,
-    user_id         STRING,
-    track_id        STRING,
-    title           STRING,
-    genre           STRING,
-    country         STRING,
-    is_valid        INT,
-    event_timestamp TIMESTAMP
-)
-USING iceberg
-PARTITIONED BY (days(event_timestamp), country)
 ```
 
 ## Deploy to GCP
@@ -444,19 +279,4 @@ terraform apply
 Resources created: VPC, subnet, firewall, static IP, GCS bucket, GCE VM (e2-standard-4).
 The VM automatically clones this repo and runs `docker compose up` on startup.
 
-## Capacity Estimation
-
-Based on 700M MAUs with 20% daily active users:
-
-Assumptions:
-- 20% DAU rate → 140M daily active users
-- DAU distributed evenly across 24 hours → at any given hour, 1/24 of DAU are active
-- Each active user generates 1 event every 5 seconds
-
-```
-700M × 20% ÷ 24hr × 3600s/hr ÷ 5s/event
-= ~4.2 Billion events/hour
-= ~1.2 Million events/second
-```
-
-This project simulates the architecture at this scale. The local Docker Compose setup is for development and demonstration purposes. In a real deployment, Kafka partitions, Spark workers, and ClickHouse shards would scale horizontally to handle ~1.2M events/sec.
+See [docs/DESIGN.md](docs/DESIGN.md#capacity-estimation) for the capacity estimation this project's architecture is sized against (~1.2M events/sec at 700M MAUs).

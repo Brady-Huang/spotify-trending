@@ -2,7 +2,7 @@ import os
 import pandas as pd
 import logging
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json
+from pyspark.sql.functions import col, from_json, to_timestamp
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, DoubleType, IntegerType, TimestampType
 )
@@ -16,6 +16,7 @@ from iceberg_writer import configure_iceberg, init_iceberg, write_to_iceberg
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:29092")
 KAFKA_TOPIC = "play-events"
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "/tmp/spark-checkpoint")
+ICEBERG_CHECKPOINT_DIR = os.environ.get("ICEBERG_CHECKPOINT_DIR", "/tmp/spark-checkpoint-iceberg")
 PLAY_THRESHOLD_MS = 30000
 
 logging.basicConfig(
@@ -39,7 +40,7 @@ EVENT_SCHEMA = StructType([
     StructField("timestamp", DoubleType()),
 ])
 
-# 輸出 Schema
+# ClickHouse 路徑輸出 Schema（維持不變）
 PLAY_FACT_SCHEMA = StructType([
     StructField("session_id", StringType(), True),
     StructField("user_id", StringType(), True),
@@ -69,6 +70,7 @@ def create_spark_session():
 
 
 def update_session_state(session_id, pdf_iterator, state: GroupState):
+    """ClickHouse 路徑專用：即時 30 秒門檻判斷，允許為了防 OOM 而丟狀態。"""
     s_id = str(session_id[0]) if isinstance(session_id, tuple) else str(session_id)
 
     if state.exists:
@@ -88,8 +90,8 @@ def update_session_state(session_id, pdf_iterator, state: GroupState):
                 event_ts = pd.Timestamp.utcnow()
 
             current_state = getattr(row, 'state', None)
-            if current_state == "play":
-                accumulated_ms += 5000
+            position_ms = int(getattr(row, 'position_ms', 0))
+            accumulated_ms = max(accumulated_ms, position_ms)
 
             if accumulated_ms >= PLAY_THRESHOLD_MS and not play_fact_emitted:
                 results.append({
@@ -127,14 +129,6 @@ def update_session_state(session_id, pdf_iterator, state: GroupState):
             yield pd.DataFrame(results)[cols]
 
 
-def write_to_all(batch_df, batch_id):
-    """同時寫入 ClickHouse 和 Iceberg"""
-    batch_df.cache()
-    write_to_clickhouse(batch_df, batch_id)
-    write_to_iceberg(batch_df, batch_id)
-    batch_df.unpersist()
-
-
 def main():
     init_clickhouse()
     start_metrics_server(8888)
@@ -158,8 +152,20 @@ def main():
 
     events_df = raw_df.select(
         from_json(col("value").cast("string"), EVENT_SCHEMA).alias("data")
-    ).select("data.*")
+    ).select("data.*") \
+     .withColumn("event_timestamp", to_timestamp(col("timestamp")))
 
+    # --- 軌道一：全量落湖軌（無狀態，Bronze 層，事後可完全信任的底本）---
+    # 直接吃 Kafka 解析完的原始事件，不經過 applyInPandasWithState，
+    # 因此即時層為了防 OOM 而丟棄的狀態，完全不會影響這裡的完整性。
+    iceberg_query = events_df.writeStream \
+        .foreachBatch(write_to_iceberg) \
+        .outputMode("append") \
+        .option("checkpointLocation", ICEBERG_CHECKPOINT_DIR) \
+        .trigger(processingTime="10 seconds") \
+        .start()
+
+    # --- 軌道二：即時計算軌（有狀態，只對 ClickHouse 負責，允許防 OOM 漏算）---
     play_facts_df = events_df \
         .groupBy("session_id") \
         .applyInPandasWithState(
@@ -170,14 +176,14 @@ def main():
             timeoutConf=GroupStateTimeout.NoTimeout
         )
 
-    query = play_facts_df.writeStream \
-        .foreachBatch(write_to_all) \
+    clickhouse_query = play_facts_df.writeStream \
+        .foreachBatch(write_to_clickhouse) \
         .outputMode("update") \
         .option("checkpointLocation", CHECKPOINT_DIR) \
         .trigger(processingTime="10 seconds") \
         .start()
 
-    query.awaitTermination()
+    spark.streams.awaitAnyTermination()
 
 
 if __name__ == "__main__":

@@ -127,6 +127,7 @@ services:
       - AWS_SECRET_ACCESS_KEY=minioadmin
     volumes:
       - spark_checkpoint:/tmp/spark-checkpoint
+      - spark_checkpoint_iceberg:/tmp/spark-checkpoint-iceberg
     user: "root"
     ports:
       - "4040:4040"
@@ -279,6 +280,12 @@ services:
       - "8081:8080"
     volumes:
       - ./trino/catalog:/etc/trino/catalog
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
     depends_on:
       - iceberg-rest
       - minio
@@ -339,4 +346,6 @@ services:
 volumes:
   clickhouse_data:
   spark_checkpoint:
+  spark_checkpoint_iceberg:
   minio_data:
+  

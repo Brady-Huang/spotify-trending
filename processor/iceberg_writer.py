@@ -31,27 +31,45 @@ def configure_iceberg(spark):
 
 def init_iceberg(spark):
     spark.sql("CREATE NAMESPACE IF NOT EXISTS iceberg.spotify")
+    # Bronze layer: raw heartbeat events, no business logic applied.
+    # Every Kafka message lands here as-is — this is the permanent, complete source of truth
+    # that the nightly batch job re-derives play_facts_historical from.
     spark.sql("""
-        CREATE TABLE IF NOT EXISTS iceberg.spotify.play_facts (
+        CREATE TABLE IF NOT EXISTS iceberg.spotify.raw_events (
+            event_id        STRING,
             session_id      STRING,
             user_id         STRING,
             track_id        STRING,
             title           STRING,
             genre           STRING,
             country         STRING,
-            is_valid        INT,
+            position_ms     BIGINT,
+            state           STRING,
             event_timestamp TIMESTAMP
         )
         USING iceberg
-        PARTITIONED BY (days(event_timestamp), country)
+        PARTITIONED BY (days(event_timestamp))
     """)
-    logger.info("[Iceberg] Table iceberg.spotify.play_facts ready ✅")
+    logger.info("[Iceberg] Table iceberg.spotify.raw_events ready ✅")
 
 
 def write_to_iceberg(batch_df, batch_id):
+    """
+    Idempotent write via MERGE INTO keyed on (session_id, event_id).
+    If Spark retries this micro-batch (e.g. after a driver restart), the same
+    event_id will just overwrite itself instead of creating a duplicate row —
+    this is what makes the raw_events table safe to treat as ground truth.
+    """
     row_count = batch_df.count()
-    if row_count > 0:
-        batch_df.writeTo("iceberg.spotify.play_facts").append()
-        logger.info(f"🧊 [Batch {batch_id}] Successfully wrote {row_count} rows to Iceberg.")
-    else:
+    if row_count == 0:
         logger.info(f"💤 [Batch {batch_id}] No data to write to Iceberg.")
+        return
+
+    batch_df.createOrReplaceTempView("raw_events_batch")
+    batch_df.sparkSession.sql("""
+        MERGE INTO iceberg.spotify.raw_events AS target
+        USING raw_events_batch AS source
+        ON target.event_id = source.event_id
+        WHEN NOT MATCHED THEN INSERT *
+    """)
+    logger.info(f"🧊 [Batch {batch_id}] Merged {row_count} raw events into Iceberg.")
