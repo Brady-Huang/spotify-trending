@@ -276,10 +276,13 @@ services:
 
   trino:
     image: trinodb/trino:438
+    environment:
+      - JAVA_TOOL_OPTIONS=-Xmx1g
     ports:
       - "8081:8080"
     volumes:
       - ./trino/catalog:/etc/trino/catalog
+    
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
       interval: 10s

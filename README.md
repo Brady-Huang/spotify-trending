@@ -6,20 +6,63 @@ A production-grade real-time data pipeline simulating Spotify's trending songs s
 
 ## Architecture
 
-**Streaming (Real-time) — two independent streaming queries sharing the same Kafka source:**
 ```
-                    ┌─▶ [Bronze sink]      Spark (stateless, append)      → Iceberg raw_events (MERGE INTO, event_id dedup, permanent)
-Producer → Kafka ──┤
-                    └─▶ [Serving sink]     Spark (applyInPandasWithState) → ClickHouse play_facts (probabilistic dedup, 7-day TTL)
-                                                                            → play_counts_1m (MV) → Redis Cache → FastAPI
+┌─────────────┐     ┌─────────────┐
+│   Producer  │────▶│    Kafka    │
+│  (Python)   │     │  (Message   │
+└─────────────┘     │   Queue)    │
+                    └──────┬──────┘
+                           │  (single source, two independent streaming queries)
+              ┌────────────┴────────────────┐
+              ▼                             ▼
+   ┌─────────────────────┐      ┌──────────────────────────┐
+   │ Bronze sink           │      │ Serving sink               │
+   │ Spark (stateless)    │      │ Spark applyInPandasWithState │
+   │ append, no logic     │      │ - Session Tracking        │
+   └──────────┬───────────┘      │ - 30s Play Threshold      │
+              │                  └──────────┬────────────────┘
+              ▼                             ▼
+   ┌─────────────────────┐      ┌──────────────────────────┐
+   │ Iceberg on MinIO     │      │  ClickHouse               │
+   │ raw_events           │      │  play_facts (7-day TTL)   │
+   │ MERGE INTO event_id   │      │  probabilistic dedup      │
+   │ (exact dedup,        │      │  play_counts_1m (MV)      │
+   │  permanent)           │      └──────────┬────────────────┘
+   └──────────┬───────────┘                 │
+              │                             ▼
+              ▼                   ┌─────────────────┐
+   ┌─────────────────┐            │  Redis Cache    │
+   │     Trino       │            └────────┬────────┘
+   └────────┬────────┘                     │
+            │                              ▼
+   ┌────────▼────────┐            ┌─────────────────┐
+   │  Airflow DAG    │            │    FastAPI      │
+   │  (daily @ 1AM)  │            │  (Top K API)    │
+   └────────┬────────┘            └────────▲────────┘
+            │                              │
+            ▼                              │
+   ┌─────────────────────┐                 │
+   │ Iceberg              │                │
+   │ play_facts_historical │                │
+   │ (Silver, MERGE INTO   │                │
+   │  upsert, re-derived   │                │
+   │  is_valid)            │                │
+   └──────────┬───────────┘                 │
+              ▼                             │
+   ┌─────────────────┐                     │
+   │   ClickHouse    │─────────────────────┘
+   │  daily_trending │
+   │  (Gold)         │
+   └─────────────────┘
 ```
 
-**Batch (Daily) — Silver layer recompute, then Gold layer aggregate:**
-```
-Airflow DAG (daily @ 1AM) → Trino → Iceberg raw_events (Bronze)
-                           → MERGE INTO Iceberg play_facts_historical (Silver, re-derived is_valid)
-                           → ClickHouse daily_trending (Gold) → FastAPI
-```
+## System Design
+
+**Functional:** collect listening events from clients; rank Top K songs by dimension (country, genre); generate a daily trending report.
+
+**Non-Functional:** a play only counts after 30 seconds of listening; Top K results update every minute via Materialized View; writes must stay correct under Spark micro-batch retries (idempotency).
+
+Full requirements, production scaling considerations, and capacity estimation (~1.2M events/sec at 700M MAUs): [docs/DESIGN.md](docs/DESIGN.md#system-design)
 
 ## Key Design Highlights
 
@@ -186,7 +229,7 @@ docker compose exec trino trino --execute "SELECT count(*) AS total, count(DISTI
 
 **7. Trigger the daily batch DAG manually**
 
-Open http://localhost:8090, find `daily_trending_report`, and trigger it manually. Once complete, verify results:
+Open http://localhost:8090, find `spotify_batch_pipeline`, and trigger it manually. It runs `check_connections → create_daily_trending_table → compute_play_facts_historical → compute_daily_trending`. Once complete, verify results:
 ```bash
 curl "http://localhost:8123/?query=SELECT%20*%20FROM%20daily_trending%20ORDER%20BY%20dimension_type%2C%20rank%20ASC%20LIMIT%2020"
 ```

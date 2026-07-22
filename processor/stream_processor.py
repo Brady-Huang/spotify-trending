@@ -155,9 +155,7 @@ def main():
     ).select("data.*") \
      .withColumn("event_timestamp", to_timestamp(col("timestamp")))
 
-    # --- 軌道一：全量落湖軌（無狀態，Bronze 層，事後可完全信任的底本）---
-    # 直接吃 Kafka 解析完的原始事件，不經過 applyInPandasWithState，
-    # 因此即時層為了防 OOM 而丟棄的狀態，完全不會影響這裡的完整性。
+   
     iceberg_query = events_df.writeStream \
         .foreachBatch(write_to_iceberg) \
         .outputMode("append") \
@@ -165,7 +163,6 @@ def main():
         .trigger(processingTime="10 seconds") \
         .start()
 
-    # --- 軌道二：即時計算軌（有狀態，只對 ClickHouse 負責，允許防 OOM 漏算）---
     play_facts_df = events_df \
         .groupBy("session_id") \
         .applyInPandasWithState(
