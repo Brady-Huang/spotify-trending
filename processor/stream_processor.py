@@ -12,7 +12,7 @@ from metrics import PrometheusStreamingListener, start_metrics_server
 from clickhouse_writer import init_clickhouse, write_to_clickhouse
 from iceberg_writer import configure_iceberg, init_iceberg, write_to_iceberg
 
-# --- 配置區 ---
+# --- Configuration ---
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:29092")
 KAFKA_TOPIC = "play-events"
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "/tmp/spark-checkpoint")
@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SpotifyProcessor")
 
-# Kafka 輸入 Schema
+# Kafka input schema
 EVENT_SCHEMA = StructType([
     StructField("event_id", StringType()),
     StructField("session_id", StringType()),
@@ -40,7 +40,7 @@ EVENT_SCHEMA = StructType([
     StructField("timestamp", DoubleType()),
 ])
 
-# ClickHouse 路徑輸出 Schema（維持不變）
+# ClickHouse output schema
 PLAY_FACT_SCHEMA = StructType([
     StructField("session_id", StringType(), True),
     StructField("user_id", StringType(), True),
@@ -55,6 +55,9 @@ PLAY_FACT_SCHEMA = StructType([
 
 def create_spark_session():
     spark_master = os.environ.get("SPARK_MASTER", "local[*]")
+    # backpressure.enabled + initialRate throttle how fast Spark pulls from Kafka
+    # when the pipeline falls behind, preventing an unbounded backlog from
+    # overwhelming executors after a slow batch or restart.
     return SparkSession.builder \
         .appName("SpotifyTrendingProcessor") \
         .master(spark_master) \
@@ -70,7 +73,7 @@ def create_spark_session():
 
 
 def update_session_state(session_id, pdf_iterator, state: GroupState):
-    """ClickHouse 路徑專用：即時 30 秒門檻判斷，允許為了防 OOM 而丟狀態。"""
+    """ClickHouse path only: real-time 30-second threshold check, allowed to drop state to prevent OOM."""
     s_id = str(session_id[0]) if isinstance(session_id, tuple) else str(session_id)
 
     if state.exists:
@@ -91,6 +94,9 @@ def update_session_state(session_id, pdf_iterator, state: GroupState):
 
             current_state = getattr(row, 'state', None)
             position_ms = int(getattr(row, 'position_ms', 0))
+
+            # Use max() instead of += to make this idempotent — replaying the same
+            # heartbeat twice (e.g. after a Spark retry) won't inflate the count.
             accumulated_ms = max(accumulated_ms, position_ms)
 
             if accumulated_ms >= PLAY_THRESHOLD_MS and not play_fact_emitted:
@@ -119,6 +125,8 @@ def update_session_state(session_id, pdf_iterator, state: GroupState):
                         "is_valid": 0,
                         "event_timestamp": event_ts
                     })
+                # Session ended — remove its state to prevent unbounded memory growth
+                # from long-lived or abandoned sessions.
                 state.remove()
                 if results:
                     yield pd.DataFrame(results)[cols]
@@ -141,6 +149,8 @@ def main():
 
     spark.streams.addListener(PrometheusStreamingListener())
 
+    # maxOffsetsPerTrigger caps events processed per micro-batch to bound memory
+    # usage and avoid overwhelming downstream sinks during traffic spikes.
     raw_df = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", KAFKA_BROKER) \
@@ -155,7 +165,10 @@ def main():
     ).select("data.*") \
      .withColumn("event_timestamp", to_timestamp(col("timestamp")))
 
-   
+    # Dual sink design: Bronze (stateless, lossless) and Serving (stateful, best-effort)
+    # run as two independent streaming queries against the same Kafka source, each with
+    # its own checkpoint. A failure or state eviction in the serving path can't affect
+    # Bronze's completeness.
     iceberg_query = events_df.writeStream \
         .foreachBatch(write_to_iceberg) \
         .outputMode("append") \
@@ -163,6 +176,8 @@ def main():
         .trigger(processingTime="10 seconds") \
         .start()
 
+    # NoTimeout — session cleanup is driven by the explicit "stop" event,
+    # not by inactivity timeout.
     play_facts_df = events_df \
         .groupBy("session_id") \
         .applyInPandasWithState(

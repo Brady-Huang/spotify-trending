@@ -17,11 +17,11 @@ default_args = {
 
 
 def check_connections():
-    # 確認 ClickHouse 可連
+    # Confirm ClickHouse is reachable
     ch_client = clickhouse_driver.Client(host=CLICKHOUSE_HOST)
     ch_client.execute("SELECT 1")
 
-    # 確認 Trino 可連
+    # Confirm Trino is reachable
     conn = trino.dbapi.connect(host=TRINO_HOST, port=TRINO_PORT, user="airflow")
     cursor = conn.cursor()
     cursor.execute("SELECT 1")
@@ -46,14 +46,18 @@ def create_daily_trending_table():
 
 def compute_play_facts_historical(**context):
     """
-    Silver 層：從 raw_events（Bronze，原始心跳明細）精算出每個 session
-    最終的 is_valid 結論，寫進 play_facts_historical。
+    Silver layer: re-derives each session's final is_valid conclusion from
+    raw_events (Bronze, raw heartbeat detail), and writes it to
+    play_facts_historical.
 
-    用 MERGE INTO（真正的 upsert）而不是 DELETE+INSERT，理由：
-    - 這個任務本身要能安全地重跑（late data 抵達後重新計算同一天）
-    - DELETE+INSERT 是兩個非原子操作，中間失敗會讓資料短暫消失
-    - MERGE INTO 是單一原子操作，WHEN MATCHED 時直接覆蓋成最新結論，
-      WHEN NOT MATCHED 時插入新結論，不會有「刪了但沒插入」的中間態
+    Uses MERGE INTO (a true upsert) instead of DELETE+INSERT, because:
+    - This task must be safe to rerun (e.g. recomputing the same day after
+      late-arriving data)
+    - DELETE+INSERT is two non-atomic operations — a failure in between can
+      leave the data missing for a moment
+    - MERGE INTO is a single atomic operation: WHEN MATCHED overwrites with
+      the freshly computed result, WHEN NOT MATCHED inserts it — there's no
+      "deleted but not reinserted" intermediate state
     """
     report_date = datetime.utcnow().date()
     start = datetime.combine(report_date, datetime.min.time())
@@ -62,7 +66,7 @@ def compute_play_facts_historical(**context):
     conn = trino.dbapi.connect(host=TRINO_HOST, port=TRINO_PORT, user="airflow")
     cursor = conn.cursor()
 
-    # Silver 層 table，如果還不存在就建立
+    # Create the Silver layer table if it doesn't exist yet
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS iceberg.spotify.play_facts_historical (
             session_id      VARCHAR,
@@ -77,8 +81,9 @@ def compute_play_facts_historical(**context):
     """)
     cursor.fetchall()
 
-    # 對今天這個時間範圍內的所有 session，用 MAX(position_ms) >= 30000
-    # 判定是否為有效播放，然後 upsert 進 play_facts_historical
+    # For every session in today's time range, determine is_valid via
+    # MAX(position_ms) >= 30000, then upsert the result into
+    # play_facts_historical.
     cursor.execute(f"""
         MERGE INTO iceberg.spotify.play_facts_historical AS target
         USING (
@@ -117,8 +122,9 @@ def compute_play_facts_historical(**context):
 
 def compute_daily_trending(**context):
     """
-    Gold 層：查 play_facts_historical（Silver，已精算過的 session 結論），
-    算出當天各維度的 Top 10，寫進 ClickHouse daily_trending 給 API serving。
+    Gold layer: queries play_facts_historical (Silver, already-reconciled
+    session conclusions), computes each dimension's daily Top 10, and writes
+    it to ClickHouse daily_trending for API serving.
     """
     report_date = datetime.utcnow().date()
     start = datetime.combine(report_date, datetime.min.time())
