@@ -55,7 +55,7 @@ def init_iceberg(spark):
 
 def write_to_iceberg(batch_df, batch_id):
     """
-    Idempotent write via MERGE INTO keyed on (session_id, event_id).
+    Idempotent write via MERGE INTO keyed on (event_id).
     If Spark retries this micro-batch (e.g. after a driver restart), the same
     event_id will just overwrite itself instead of creating a duplicate row —
     this is what makes the raw_events table safe to treat as ground truth.

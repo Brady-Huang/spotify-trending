@@ -64,7 +64,8 @@ random.seed()
 def create_producer():
     return KafkaProducer(
         bootstrap_servers=KAFKA_BROKER,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8")
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        enable_idempotence=True
     )
 def simulate_user_session(producer, user_id, track, country):
     """模擬一個用戶的完整收聽 session"""
